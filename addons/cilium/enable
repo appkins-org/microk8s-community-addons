@@ -4,10 +4,15 @@ set -e
 
 source $SNAP/actions/common/utils.sh
 
+CURRENT_DIR=$(cd $(dirname "${BASH_SOURCE[0]}") && pwd)
+
 "$SNAP/microk8s-enable.wrapper" helm3
 
 CILIUM_VERSION=""
 INSTALL_CILIUM_CLI="True"
+
+IPv4_CLUSTER_CIDR="10.32.0.0/16"
+IPv4_SERVICE_CIDR="10.33.0.0/16"
 
 # Parse command-line arguments
 while [ "$#" -gt 0 ]; do
@@ -35,6 +40,14 @@ if ! grep -qE -- "--allow-privileged=true" "$SNAP_DATA/args/kube-apiserver"; the
   restart_service apiserver
 fi
 
+echo "Ensure kube-controller-manager --cluster-cidr=$IPv4_CLUSTER_CIDR flag"
+if ! grep -qE -- "--cluster-cidr=$IPv4_CLUSTER_CIDR" "$SNAP_DATA/args/kube-controller-manager"; then
+  echo "Adding kube-controller-manager --allow-privileged=true flag"
+  refresh_opt_in_config "cluster-cidr" "$IPv4_CLUSTER_CIDR" kube-controller-manager
+  echo "Restarting kube-controller-manager"
+  restart_service controller-manager
+fi
+
 set_service_not_expected_to_start flanneld
 run_with_sudo preserve_env snapctl stop "${SNAP_NAME}.daemon-flanneld"
 remove_vxlan_interfaces
@@ -55,6 +68,15 @@ then
   # give a bit slack before moving the file out, sometimes it gives out this error "rpc error: code = Unknown desc = checkpoint in progress".
   sleep 2s
   run_with_sudo mv "$SNAP_DATA/args/cni-network/cni.yaml" "$SNAP_DATA/args/cni-network/cni.yaml.disabled"
+fi
+
+# Disable Kube Proxy
+echo "Ensure kube-proxy --cleanup=true flag"
+if ! grep -qE -- "--cleanup=true" "$SNAP_DATA/args/kube-proxy"; then
+  echo "Adding kube-proxy --cleanup=true flag"
+  refresh_opt_in_config "cleanup" "true" kube-proxy
+  echo "Restarting kube-proxy"
+  restart_service proxy
 fi
 
 echo "Enabling Cilium"
@@ -88,8 +110,7 @@ else
   run_with_sudo mv "$SNAP_DATA/args/cni-network/cni.conf" "$SNAP_DATA/args/cni-network/10-kubenet.conf" 2>/dev/null || true
   run_with_sudo mv "$SNAP_DATA/args/cni-network/flannel.conflist" "$SNAP_DATA/args/cni-network/20-flanneld.conflist" 2>/dev/null || true
   run_with_sudo cp "$SNAP_DATA/tmp/cilium/$CILIUM_DIR/$CILIUM_CNI_CONF" "$SNAP_DATA/args/cni-network/05-cilium-cni.conf"
-  
-  IPv4_CLUSTER_CIDR="10.1.0.0/16"
+
   if [ -e "${SNAP_DATA}/args/cni-env" ]; then
     source "${SNAP_DATA}/args/cni-env"
   fi
@@ -108,13 +129,33 @@ else
       --set daemon.runPath="/var/snap/microk8s/current/var/run/cilium" \
       --set operator.replicas=1 \
       --set keepDeprecatedLabels=true \
+      --set ipv4NativeRoutingCIDR="${IPv4_CLUSTER_CIDR}" \
       --set ipam.operator.clusterPoolIPv4PodCIDRList[0]="${IPv4_CLUSTER_CIDR}" \
-      --set nodePort.enabled=true
+      --set k8sServiceHost="$(hostname -I | awk '{print $1}')" \
+      --set k8sServicePort=16443 \
+      --set kubeProxyReplacement=strict \
+      --set kubeProxyReplacementHealthzBindAddr=0.0.0.0:10256 \
+      --set externalIPs.enabled=true \
+      --set l2announcements.enabled=true \
+      --set loadBalancer.algorithm=maglev \
+      --set loadBalancer.mode=dsr \
+      --set localRedirectPolicy=true \
+      --set securityContext.privileged=true \
+      --set tunnel=disabled \
+      --set ingressController.enabled=true \
+      --set ingressController.enforceHttps=false \
+      --set ingressController.loadbalancerMode=shared \
+      --set ingressController.default=true \
+      --set ingressController.service.type="LoadBalancer" \
+      --set nodePort.enabled=true \
+      --set annotateK8sNode=true
   )
 
   ${SNAP}/microk8s-status.wrapper --wait-ready >/dev/null
   echo "Waiting for cilium. This may take several minutes."
   "$SNAP/microk8s-kubectl.wrapper" -n $NAMESPACE rollout status ds/cilium
+
+  # ${SNAP}/microk8s-kubectl.wrapper -n $NAMESPACE apply -f "${SNAP_DATA}/tmp/cilium/$CILIUM_DIR/install/kubernetes/operator/cilium-operator.yaml"
 
   # Skip installing the Cilium CLI binary if the cluster is in offline mode
   if [[ "$INSTALL_CILIUM_CLI" == "True" ]]; then
@@ -123,7 +164,7 @@ else
     ARCH=$(arch)
     SCRIPT_DIR=$(cd $(dirname "${BASH_SOURCE[0]}") && pwd)
     run_with_sudo mkdir -p "${SCRIPT_DIR}/cli/"
-    fetch_as "https://github.com/cilium/cilium-cli/releases/download/v0.15.2/cilium-linux-${ARCH}.tar.gz" "$SNAP_DATA/tmp/cilium.tar.gz"
+    fetch_as "https://github.com/cilium/cilium-cli/releases/download/v0.15.11/cilium-linux-${ARCH}.tar.gz" "$SNAP_DATA/tmp/cilium.tar.gz"
     run_with_sudo tar -zxf "$SNAP_DATA/tmp/cilium.tar.gz" -C "${SCRIPT_DIR}/cli"
     run_with_sudo chmod +x "${SCRIPT_DIR}/cli/cilium"
     run_with_sudo cp "${SCRIPT_DIR}/cilium" "${SNAP_COMMON}/plugins/cilium"
